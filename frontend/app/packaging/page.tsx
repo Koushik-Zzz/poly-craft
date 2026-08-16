@@ -1,5 +1,4 @@
 "use client";
-
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -41,6 +40,7 @@ function Packaging() {
     setPackageModel(newModel);
     setSelectedPanelId(null);
   }, [packageType, dimensions.width, dimensions.height, dimensions.depth]);
+
   const handlePackageTypeChange = useCallback((type: PackageType) => {
     setPackageType(type);
     setDimensions(DEFAULT_PACKAGE_DIMENSIONS[type]);
@@ -58,7 +58,7 @@ function Packaging() {
 
   const handleTextureGenerated = useCallback((panelId: PanelId, textureUrl: string) => {
     setPanelTextures((prev) => ({ ...prev, [panelId]: textureUrl }));
-    
+
     setPackageModel((prev) => ({
       ...prev,
       panelStates: {
@@ -69,7 +69,6 @@ function Packaging() {
         },
       },
     }));
-
     setShowTextureNotification({ panelId, show: true });
     setTimeout(() => setShowTextureNotification(null), 3000);
   }, []);
@@ -104,7 +103,6 @@ function Packaging() {
                   color="#60a5fa"
                   panelTextures={panelTextures}
                 />
-
                 {showTextureNotification?.show && (
                   <div className="absolute top-4 left-1/2 transform -translate-x-1/2 z-50 animate-in fade-in slide-in-from-top-2 duration-300">
                     <div className="bg-green-600 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-3 border-2 border-green-700">
@@ -127,24 +125,17 @@ function Packaging() {
           <div className="border-b-2 border-black shrink-0 px-4 py-3">
             <h2 className="text-sm font-semibold">Controls</h2>
           </div>
+
           <div className="border-b border-border p-4 shrink-0 bg-muted/10">
             <h3 className="text-xs font-medium text-muted-foreground mb-2">AI Assistant</h3>
-            <AIChatPanel 
+            <AIChatPanel
               selectedPanelId={selectedPanelId}
               packageModel={packageModel}
               onTextureGenerated={handleTextureGenerated}
             />
           </div>
+
           <div className="flex-1 overflow-y-auto p-4 flex flex-col space-y-4">
-            {/* AI Assistant Section */}
-            <div className="space-y-2">
-              <Label className="text-xs font-medium text-muted-foreground">AI Assistant</Label>
-              <AIChatPanel 
-                selectedPanelId={selectedPanelId}
-                packageModel={packageModel}
-                onTextureGenerated={handleTextureGenerated}
-              />
-            </div>
             {/* View Toggle Buttons */}
             <div className="space-y-2">
               <Label className="text-xs font-medium text-muted-foreground">View Mode</Label>
@@ -223,7 +214,6 @@ function Packaging() {
             {/* Dimensions */}
             <Card className="p-4 space-y-4">
               <h3 className="text-sm font-semibold text-foreground">Dimensions (mm)</h3>
-
               {packageType === "box" ? (
                 <>
                   <div className="space-y-2">
@@ -251,7 +241,6 @@ function Packaging() {
                       className="w-full"
                     />
                   </div>
-
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
                       <Label className="text-xs">Y</Label>
@@ -277,7 +266,6 @@ function Packaging() {
                       className="w-full"
                     />
                   </div>
-
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
                       <Label className="text-xs">Z</Label>
@@ -327,7 +315,6 @@ function Packaging() {
                       className="w-full"
                     />
                   </div>
-
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
                       <Label className="text-xs">Height</Label>
@@ -379,7 +366,6 @@ function Packaging() {
                 </div>
               </div>
             </Card>
-
           </div>
         </div>
       </div>
