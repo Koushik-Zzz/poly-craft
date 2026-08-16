@@ -1,4 +1,6 @@
 {
+  "name": "PolyCraft",
+  "version": "1.0.0",
   "dependencies": {
     "motion": "^12.23.24",
     "framer-motion": "^12.23.26"
