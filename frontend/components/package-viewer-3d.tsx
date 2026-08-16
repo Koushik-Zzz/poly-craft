@@ -305,7 +305,7 @@ function CylinderPackage3D({
     return material
   }, [color, panelTextures])
 
-  const handleBodyClick = (event: THREE.Event) => {
+  const handleBodyClick = (event: any) => {
     if (!onPanelSelect) return
     event.stopPropagation()
     if ("body" === selectedPanelId) {
@@ -315,7 +315,7 @@ function CylinderPackage3D({
     }
   }
 
-  const handleTopClick = (event: THREE.Event) => {
+  const handleTopClick = (event: any) => {
     if (!onPanelSelect) return
     event.stopPropagation()
     if ("top" === selectedPanelId) {
@@ -325,7 +325,7 @@ function CylinderPackage3D({
     }
   }
 
-  const handleBottomClick = (event: THREE.Event) => {
+  const handleBottomClick = (event: any) => {
     if (!onPanelSelect) return
     event.stopPropagation()
     if ("bottom" === selectedPanelId) {

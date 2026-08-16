@@ -1,398 +1,828 @@
 "use client";
+
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
-import { Label } from "@/components/ui/label";
-import { Input } from "@/components/ui/input";
-import { Slider } from "@/components/ui/slider";
-import { DielineEditor } from "@/components/dieline-editor";
-import { PackageViewer3D } from "@/components/package-viewer-3d";
-import { AIChatPanel } from "@/components/AIChatPanel";
-import { CylinderIcon, Box, CheckCircle2 } from "lucide-react";
-import {
-  type PackageType,
-  type PackageDimensions,
-  DEFAULT_PACKAGE_DIMENSIONS,
-  generatePackageModel,
-  updateModelFromDielines,
-  type PackageModel,
-  type PanelId,
-} from "@/lib/packaging-types";
+import { Textarea } from "@/components/ui/textarea";
+import { Loader2, RotateCcw } from "lucide-react";
+import { editProduct, getProductStatus, rewindProduct } from "@/lib/product-api";
+import { clearCachedModel } from "@/lib/model-cache";
+import { ProductState, ProductStatus } from "@/lib/product-types";
+import type { PanelId, PackageModel } from "@/lib/packaging-types";
+import { usePanelTexture } from "@/hooks/usePanelTexture";
+import { API_ENDPOINTS } from "@/lib/api-config";
 
-const PACKAGE_TYPES: readonly { type: PackageType; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { type: "box", label: "Box", icon: Box },
-  { type: "cylinder", label: "Cylinder", icon: CylinderIcon },
-] as const;
+// Product editing props
+interface ProductAIChatPanelProps {
+  productState: ProductState | null;
+  isEditInProgress: boolean;
+  onEditStart: () => void;
+  onEditComplete: () => Promise<void> | void;
+  onEditError: () => void;
+  selectedPanelId?: never;
+  packageModel?: never;
+  onTextureGenerated?: never;
+}
 
-function Packaging() {
-  const [packageType, setPackageType] = useState<PackageType>("box");
-  const [dimensions, setDimensions] = useState<PackageDimensions>(DEFAULT_PACKAGE_DIMENSIONS.box);
-  const [packageModel, setPackageModel] = useState<PackageModel>(() =>
-    generatePackageModel("box", DEFAULT_PACKAGE_DIMENSIONS.box)
-  );
-  const [selectedPanelId, setSelectedPanelId] = useState<PanelId | null>(null);
-  const [activeView, setActiveView] = useState<"2d" | "3d">("3d");
-  const [panelTextures, setPanelTextures] = useState<Partial<Record<PanelId, string>>>({});
-  const [showTextureNotification, setShowTextureNotification] = useState<{ panelId: PanelId; show: boolean } | null>(null);
-  const [isEditInProgress, setIsEditInProgress] = useState(false);
+// Packaging texture generation props
+interface PackagingAIChatPanelProps {
+  selectedPanelId?: PanelId | null;
+  packageModel?: PackageModel;
+  onTextureGenerated?: (panelId: PanelId, textureUrl: string) => void;
+  productState?: never;
+  isEditInProgress?: never;
+  onEditStart?: never;
+  onEditComplete?: never;
+  onEditError?: never;
+}
 
+type AIChatPanelProps = ProductAIChatPanelProps | PackagingAIChatPanelProps;
+
+export function AIChatPanel(props: AIChatPanelProps) {
+  // Determine if this is product editing or packaging texture generation
+  const isProductMode = "productState" in props;
+  
+  if (isProductMode) {
+    return <ProductAIChatPanel {...(props as ProductAIChatPanelProps)} />;
+  }
+  return <PackagingAIChatPanel {...(props as PackagingAIChatPanelProps)} />;
+}
+
+function ProductAIChatPanel({
+  productState,
+  isEditInProgress,
+  onEditStart,
+  onEditComplete,
+  onEditError,
+}: ProductAIChatPanelProps) {
+  const [prompt, setPrompt] = useState("");
+  const [editStatus, setEditStatus] = useState<ProductStatus | null>(null);
+  const [isMounted, setIsMounted] = useState(false);
+  const [rewindTarget, setRewindTarget] = useState<number | null>(null);
+
+  const suggestions = [
+    "Make the model taller",
+    "Change the color to blue",
+    "Add more details",
+    "Rotate the model 90 degrees",
+    "Make it smaller",
+    "Add lighting effects",
+  ];
+
+  // Avoid hydration mismatch
   useEffect(() => {
-    const newModel = generatePackageModel(packageType, dimensions);
-    setPackageModel(newModel);
-    setSelectedPanelId(null);
-  }, [packageType, dimensions.width, dimensions.height, dimensions.depth]);
-
-  const handlePackageTypeChange = useCallback((type: PackageType) => {
-    setPackageType(type);
-    setDimensions(DEFAULT_PACKAGE_DIMENSIONS[type]);
-    setSelectedPanelId(null);
+    setIsMounted(true);
   }, []);
 
-  const handleDimensionChange = useCallback((key: keyof PackageDimensions, value: number) => {
-    const validValue = isNaN(value) || value < 0 ? 0 : value;
-    setDimensions((prev) => ({ ...prev, [key]: validValue }));
-  }, []);
+  // Poll backend status while edit is running
+  useEffect(() => {
+    if (!isEditInProgress) {
+      setEditStatus(null);
+      return;
+    }
 
-  const handleDielineChange = useCallback((newDielines: typeof packageModel.dielines) => {
-    setPackageModel((prev) => updateModelFromDielines(prev, newDielines));
-  }, []);
+    let isCancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
-  const handleTextureGenerated = useCallback((panelId: PanelId, textureUrl: string) => {
-    setPanelTextures((prev) => ({ ...prev, [panelId]: textureUrl }));
+    const poll = async () => {
+      try {
+        const status = await getProductStatus();
+        if (isCancelled) {
+          return;
+        }
+        setEditStatus(status);
 
-    setPackageModel((prev) => ({
-      ...prev,
-      panelStates: {
-        ...prev.panelStates,
-        [panelId]: {
-          ...prev.panelStates[panelId],
-          textureUrl,
-        },
-      },
-    }));
-    setShowTextureNotification({ panelId, show: true });
-    setTimeout(() => setShowTextureNotification(null), 3000);
-  }, []);
+        if (status.status === "complete") {
+          await onEditComplete();
+          return;
+        }
 
-  // AIChatPanel's actual interface: it edits a whole ProductState via
-  // editProduct/getProductStatus, not per-panel textures. Wired up as
-  // no-ops/stubs here just to satisfy its props until it's reconciled
-  // with the packaging data model.
-  const handleEditStart = useCallback(() => {
-    setIsEditInProgress(true);
-  }, []);
+        if (status.status === "error") {
+          onEditError();
+          return;
+        }
+      } catch (error) {
+        console.error("Failed to poll product status:", error);
+      }
 
-  const handleEditComplete = useCallback(async () => {
-    setIsEditInProgress(false);
-    // NOTE: AIChatPanel has no way to tell us which panel/texture changed,
-    // so handleTextureGenerated can't be invoked from here as-is.
-  }, []);
+      if (!isCancelled) {
+        timeoutId = setTimeout(poll, 3000);
+      }
+    };
 
-  const handleEditError = useCallback((error: Error) => {
-    console.error(error);
-    setIsEditInProgress(false);
-  }, []);
+    poll();
 
-  const surfaceArea = useMemo(() => {
-    const { width, height, depth } = dimensions;
-    return packageType === "box"
-      ? Math.round(2 * (width * height + width * depth + height * depth))
-      : Math.round(Math.PI * width * height + 2 * Math.PI * (width / 2) ** 2);
-  }, [packageType, dimensions]);
+    return () => {
+      isCancelled = true;
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    };
+  }, [isEditInProgress, onEditComplete, onEditError]);
+
+  const iterations = useMemo(() => productState?.iterations ?? [], [productState?.iterations]);
+  const canEdit = Boolean(productState?.images?.length);
+
+  const formatDuration = (value?: number) => {
+    if (value === undefined || value === null) {
+      return null;
+    }
+    if (value < 60) {
+      return `${Math.max(1, Math.round(value))}s`;
+    }
+    const minutes = Math.floor(value / 60);
+    const seconds = Math.round(value % 60);
+    if (minutes >= 60) {
+      const hours = Math.floor(minutes / 60);
+      const remMinutes = minutes % 60;
+      return `${hours}h ${remMinutes}m`;
+    }
+    return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+  };
+
+  const handleSubmit = async () => {
+    if (!prompt.trim() || !canEdit) return;
+
+    try {
+      onEditStart();
+      await editProduct(prompt.trim());
+      setPrompt("");
+    } catch (error) {
+      console.error("Edit failed:", error);
+      onEditError();
+    }
+  };
+
+  const handleRewind = async (iterationIndex: number) => {
+    try {
+      setRewindTarget(iterationIndex);
+      await rewindProduct(iterationIndex);
+      if (productState?.iterations?.length) {
+        const staleIterations = productState.iterations.slice(iterationIndex + 1);
+        await Promise.all(staleIterations.map((iteration) => clearCachedModel(iteration.id)));
+      }
+      await onEditComplete();
+    } catch (error) {
+      console.error("Rewind failed:", error);
+      onEditError();
+    } finally {
+      setRewindTarget(null);
+    }
+  };
 
   return (
-    <div className="h-screen bg-background flex flex-col overflow-hidden">
-      <div className="flex-1 flex overflow-hidden">
-        <div className="flex-1 flex flex-col overflow-hidden">
-          <div className="flex-1 overflow-hidden">
-            {activeView === "2d" ? (
-              <DielineEditor
-                dielines={packageModel.dielines}
-                panels={packageModel.panels}
-                selectedPanelId={selectedPanelId}
-                onDielineChange={handleDielineChange}
-                onPanelSelect={setSelectedPanelId}
-                editable={true}
-              />
-            ) : (
-              <div className="h-full bg-muted/30 relative">
-                <PackageViewer3D
-                  model={packageModel}
-                  selectedPanelId={selectedPanelId}
-                  onPanelSelect={setSelectedPanelId}
-                  color="#60a5fa"
-                  panelTextures={panelTextures}
-                />
-                {showTextureNotification?.show && (
-                  <div className="absolute top-4 left-1/2 transform -translate-x-1/2 z-50 animate-in fade-in slide-in-from-top-2 duration-300">
-                    <div className="bg-green-600 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-3 border-2 border-green-700">
-                      <CheckCircle2 className="w-5 h-5" />
-                      <div>
-                        <p className="font-semibold">Texture Applied! 🎨</p>
-                        <p className="text-sm opacity-90">
-                          {packageModel.panels.find(p => p.id === showTextureNotification.panelId)?.name} panel updated
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
+    <div className="space-y-4 flex-1 flex flex-col">
+      {!canEdit && (
+        <div className="text-xs p-3 border-2 border-dashed border-muted-foreground rounded-lg text-muted-foreground">
+          Generate a base product first to unlock editing.
         </div>
+      )}
 
-        <div className="w-[380px] border-l-2 border-black bg-card overflow-hidden flex flex-col shrink-0">
-          <div className="border-b-2 border-black shrink-0 px-4 py-3">
-            <h2 className="text-sm font-semibold">Controls</h2>
+      {isEditInProgress && editStatus && (
+        <div className="p-3 bg-blue-50 border-2 border-blue-500 rounded-lg text-xs space-y-2">
+          <div className="flex items-center gap-2 font-medium text-blue-900">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            {editStatus.message || "Processing edit..."}
           </div>
-
-          <div className="border-b border-border p-4 shrink-0 bg-muted/10">
-            <h3 className="text-xs font-medium text-muted-foreground mb-2">AI Assistant</h3>
-            <AIChatPanel
-              productState={null}
-              isEditInProgress={isEditInProgress}
-              onEditStart={handleEditStart}
-              onEditComplete={handleEditComplete}
-              onEditError={handleEditError}
+          <div className="w-full bg-blue-200 rounded-full h-1.5 overflow-hidden">
+            <div
+              className="bg-blue-500 h-1.5 rounded-full transition-all duration-300"
+              style={{ width: `${Math.min(editStatus.progress || 0, 100)}%` }}
             />
           </div>
+        </div>
+      )}
 
-          <div className="flex-1 overflow-y-auto p-4 flex flex-col space-y-4">
-            {/* View Toggle Buttons */}
-            <div className="space-y-2">
-              <Label className="text-xs font-medium text-muted-foreground">View Mode</Label>
-              <div className="flex gap-2">
-                <Button
-                  variant={activeView === "2d" ? "default" : "outline"}
-                  className="flex-1"
-                  size="sm"
-                  onClick={() => setActiveView("2d")}
-                >
-                  2D Dieline Editor
-                </Button>
-                <Button
-                  variant={activeView === "3d" ? "default" : "outline"}
-                  className="flex-1"
-                  size="sm"
-                  onClick={() => setActiveView("3d")}
-                >
-                  3D Preview
-                </Button>
-              </div>
-            </div>
+      <div className="space-y-2">
+        <Textarea
+          placeholder={canEdit ? "Describe changes..." : "Generate a base product first"}
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          className="min-h-[80px] resize-none text-sm"
+          disabled={isEditInProgress || !canEdit}
+        />
+        <Button
+          onClick={handleSubmit}
+          disabled={!prompt.trim() || isEditInProgress || !canEdit}
+          variant="outline"
+          className="w-full"
+          size="sm"
+        >
+          {isEditInProgress ? (
+            <>
+              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              Processing...
+            </>
+          ) : (
+            "Apply Changes"
+          )}
+        </Button>
+      </div>
 
-            {/* Package Type Selection */}
-            <div className="space-y-3">
-              <Label className="text-xs font-medium text-muted-foreground">Package Type</Label>
-              <div className="grid grid-cols-2 gap-2">
-                {PACKAGE_TYPES.map(({ type, label, icon: Icon }) => (
-                  <Button
-                    key={type}
-                    variant={packageType === type ? "default" : "outline"}
-                    className="flex flex-col items-center gap-1 h-auto py-3"
-                    size="sm"
-                    onClick={() => handlePackageTypeChange(type)}
-                  >
-                    <Icon className="w-4 h-4" />
-                    <span className="text-xs">{label}</span>
-                  </Button>
-                ))}
-              </div>
-            </div>
-
-            {/* Panel Selection */}
-            {packageModel.panels.length > 0 && (
-              <Card className="p-4 space-y-3">
-                <h3 className="text-sm font-semibold text-foreground">Select Panel</h3>
-                <div className="grid grid-cols-2 gap-2">
-                  {packageModel.panels.map((panel) => (
-                    <Button
-                      key={panel.id}
-                      variant={selectedPanelId === panel.id ? "default" : "outline"}
-                      className="text-xs"
-                      size="sm"
-                      onClick={() => setSelectedPanelId(panel.id === selectedPanelId ? null : panel.id)}
-                    >
-                      {panel.name}
-                      {panelTextures[panel.id] && (
-                        <span className="ml-1 text-[10px]">✨</span>
-                      )}
-                    </Button>
-                  ))}
-                </div>
-                {selectedPanelId && (
-                  <div className="mt-2 p-2 bg-muted rounded text-xs">
-                    <p className="font-medium">
-                      {packageModel.panels.find((p) => p.id === selectedPanelId)?.name}
-                    </p>
-                    <p className="text-muted-foreground mt-1">
-                      {packageModel.panels.find((p) => p.id === selectedPanelId)?.description}
-                    </p>
-                  </div>
-                )}
-              </Card>
-            )}
-
-            {/* Dimensions */}
-            <Card className="p-4 space-y-4">
-              <h3 className="text-sm font-semibold text-foreground">Dimensions (mm)</h3>
-              {packageType === "box" ? (
-                <>
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Label className="text-xs">X</Label>
-                      <Input
-                        type="number"
-                        value={packageModel.dimensions.width}
-                        onChange={(e) => {
-                          const val = Number(e.target.value);
-                          if (!isNaN(val) && val >= 0) {
-                            handleDimensionChange("width", val);
-                          }
-                        }}
-                        className="w-16 h-7 text-xs"
-                        min={0}
-                      />
-                    </div>
-                    <Slider
-                      value={[packageModel.dimensions.width]}
-                      onValueChange={([value]) => handleDimensionChange("width", value)}
-                      min={20}
-                      max={300}
-                      step={5}
-                      className="w-full"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Label className="text-xs">Y</Label>
-                      <Input
-                        type="number"
-                        value={packageModel.dimensions.height}
-                        onChange={(e) => {
-                          const val = Number(e.target.value);
-                          if (!isNaN(val) && val >= 0) {
-                            handleDimensionChange("height", val);
-                          }
-                        }}
-                        className="w-16 h-7 text-xs"
-                        min={0}
-                      />
-                    </div>
-                    <Slider
-                      value={[packageModel.dimensions.height]}
-                      onValueChange={([value]) => handleDimensionChange("height", value)}
-                      min={20}
-                      max={400}
-                      step={5}
-                      className="w-full"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Label className="text-xs">Z</Label>
-                      <Input
-                        type="number"
-                        value={packageModel.dimensions.depth}
-                        onChange={(e) => {
-                          const val = Number(e.target.value);
-                          if (!isNaN(val) && val >= 0) handleDimensionChange("depth", val);
-                        }}
-                        className="w-16 h-7 text-xs"
-                        min={0}
-                      />
-                    </div>
-                    <Slider
-                      value={[packageModel.dimensions.depth]}
-                      onValueChange={([value]) => handleDimensionChange("depth", value)}
-                      min={20}
-                      max={300}
-                      step={5}
-                      className="w-full"
-                    />
-                  </div>
-                </>
-              ) : packageType === "cylinder" ? (
-                <>
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Label className="text-xs">Radius</Label>
-                      <Input
-                        type="number"
-                        value={packageModel.dimensions.width / 2}
-                        onChange={(e) => {
-                          const val = Number(e.target.value);
-                          if (!isNaN(val) && val >= 0) handleDimensionChange("width", val * 2);
-                        }}
-                        className="w-16 h-7 text-xs"
-                        min={0}
-                      />
-                    </div>
-                    <Slider
-                      value={[packageModel.dimensions.width / 2]}
-                      onValueChange={([value]) => handleDimensionChange("width", value * 2)}
-                      min={10}
-                      max={150}
-                      step={5}
-                      className="w-full"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Label className="text-xs">Height</Label>
-                      <Input
-                        type="number"
-                        value={packageModel.dimensions.height}
-                        onChange={(e) => {
-                          const val = Number(e.target.value);
-                          if (!isNaN(val) && val >= 0) handleDimensionChange("height", val);
-                        }}
-                        className="w-16 h-7 text-xs"
-                        min={0}
-                      />
-                    </div>
-                    <Slider
-                      value={[packageModel.dimensions.height]}
-                      onValueChange={([value]) => handleDimensionChange("height", value)}
-                      min={20}
-                      max={400}
-                      step={5}
-                      className="w-full"
-                    />
-                  </div>
-                </>
-              ) : null}
-            </Card>
-
-            {/* Dieline Info */}
-            <Card className="p-4 space-y-2 bg-muted/50">
-              <h3 className="text-sm font-semibold text-foreground">Package Information</h3>
-              <div className="text-xs space-y-1">
-                <div className="flex justify-between text-muted-foreground">
-                  <span>Total Panels:</span>
-                  <span className="font-medium text-foreground">{packageModel.panels.length}</span>
-                </div>
-                <div className="flex justify-between text-muted-foreground">
-                  <span>Dieline Paths:</span>
-                  <span className="font-medium text-foreground">{packageModel.dielines.length}</span>
-                </div>
-                <div className="flex justify-between text-muted-foreground">
-                  <span>Total Points:</span>
-                  <span className="font-medium text-foreground">
-                    {packageModel.dielines.reduce((sum, path) => sum + path.points.length, 0)}
-                  </span>
-                </div>
-                <div className="flex justify-between text-muted-foreground">
-                  <span>Surface Area:</span>
-                  <span className="font-medium text-foreground">{surfaceArea} mm²</span>
-                </div>
-              </div>
-            </Card>
+      {isMounted && (
+        <div className="space-y-2">
+          <div className="flex flex-wrap gap-1.5">
+            {suggestions.map((suggestion) => (
+              <button
+                key={suggestion}
+                onClick={() => setPrompt(suggestion)}
+                disabled={isEditInProgress || !canEdit}
+                className="text-xs px-2.5 py-1.5 bg-secondary text-secondary-foreground rounded-full border-2 border-black hover:bg-secondary/80 transition-colors disabled:opacity-50"
+              >
+                {suggestion}
+              </button>
+            ))}
           </div>
         </div>
-      </div>
+      )}
+
+      {iterations.length > 0 && (
+        <div className="space-y-2 flex-1 flex flex-col min-h-0">
+          <div className="text-xs font-semibold text-muted-foreground">History</div>
+          <div className="space-y-2 overflow-y-auto flex-1">
+            {iterations
+              .slice()
+              .reverse()
+              .map((iteration, idx) => {
+                const actualIndex = iterations.length - 1 - idx;
+                const isCurrent = actualIndex === iterations.length - 1;
+
+                return (
+                  <div
+                    key={`${iteration.created_at}-${actualIndex}`}
+                    className={`text-xs p-2.5 rounded-lg border-2 ${
+                      isCurrent ? "bg-primary/10 border-primary" : "bg-muted border-black"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1">
+                        <p className="font-medium line-clamp-2">{iteration.prompt}</p>
+                        <p className="text-muted-foreground text-[10px] mt-1">
+                          {iteration.type} • {new Date(iteration.created_at).toLocaleTimeString()}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {formatDuration(iteration.duration_seconds) && (
+                          <span className="text-[10px] text-muted-foreground whitespace-nowrap">
+                            {formatDuration(iteration.duration_seconds)}
+                          </span>
+                        )}
+                        {!isCurrent && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6 border border-black rounded-full"
+                            disabled={isEditInProgress || rewindTarget === actualIndex}
+                            onClick={() => handleRewind(actualIndex)}
+                            title="Rewind to this version"
+                          >
+                            {rewindTarget === actualIndex ? (
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                            ) : (
+                              <RotateCcw className="w-3 h-3" />
+                            )}
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                </div>
+                );
+              })}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-export default Packaging;
+function PackagingAIChatPanel({ 
+  selectedPanelId, 
+  packageModel,
+  onTextureGenerated 
+}: PackagingAIChatPanelProps) {
+  const [prompt, setPrompt] = useState("");
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [history, setHistory] = useState<Array<{ prompt: string; response: string }>>([]);
+  const [referenceMockup, setReferenceMockup] = useState<string | null>(null);
+  const [validationError, setValidationError] = useState<string | null>(null);
+  const { generateTexture, generateAllTextures, bulkGenerating, error } = usePanelTexture();
+
+  // Validate prompt in real-time - memoized for performance
+  const validatePrompt = useCallback((text: string) => {
+    const trimmed = text.trim();
+    
+    if (trimmed.length === 0) {
+      setValidationError(null);
+      return null;
+    }
+    
+    if (trimmed.length < 3) {
+      const error = "Prompt is too short. Please be more specific.";
+      setValidationError(error);
+      return error;
+    }
+    
+    // Check for overly vague prompts - expanded list
+    const vague = ["logo", "design", "texture", "pattern", "cool", "nice", "good", "emblem", "symbol", "brand"];
+    const words = trimmed.toLowerCase().split(/\s+/);
+    
+    // Check if prompt is just a vague word or "X logo" pattern
+    if (vague.includes(trimmed.toLowerCase()) || 
+        (words.length === 2 && vague.includes(words[1]))) {
+      const error = `"${trimmed}" is too vague. Please describe what style, colors, or patterns you want. Example: "blue geometric pattern with white lines"`;
+      setValidationError(error);
+      return error;
+    }
+    
+    setValidationError(null);
+    return null;
+  }, []);
+
+  // Auto-validate when prompt changes (backup to onChange)
+  useEffect(() => {
+    if (prompt) {
+      validatePrompt(prompt);
+    }
+  }, [prompt, validatePrompt]);
+
+  // Handle reference mockup upload
+  const handleMockupUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Check file size (max 5MB)
+    if (file.size > 5 * 1024 * 1024) {
+      setHistory([
+        ...history,
+        {
+          prompt: "Reference upload",
+          response: "Image too large. Please use an image under 5MB.",
+        },
+      ]);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const base64 = event.target?.result as string;
+      setReferenceMockup(base64);
+      setHistory([
+        ...history,
+        {
+          prompt: "Reference mockup uploaded",
+          response: "Reference image uploaded successfully. Your next generation will use this as a style guide.",
+        },
+      ]);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleGenerateAll = async () => {
+    console.log("[AIChatPanel] handleGenerateAll called", { prompt, hasPackageModel: !!packageModel });
+    
+    if (!prompt.trim()) {
+      console.log("[AIChatPanel] Prompt is empty, returning");
+      return;
+    }
+    
+    // Check validation
+    if (validationError) {
+      setHistory([
+        ...history,
+        {
+          prompt: prompt.trim(),
+          response: validationError,
+        },
+      ]);
+      return;
+    }
+
+    if (!packageModel) {
+      console.log("[AIChatPanel] No package model");
+      setHistory([
+        ...history,
+        {
+          prompt,
+          response: "Package model not available.",
+        },
+      ]);
+      setPrompt("");
+      return;
+    }
+
+    setIsProcessing(true);
+    console.log("[AIChatPanel] Starting bulk texture generation...");
+
+    try {
+      // Prepare panel information
+      const panelIds = packageModel.panels.map(p => p.id);
+      const panelsInfo: Record<string, { width: number; height: number }> = {};
+      
+      for (const panel of packageModel.panels) {
+        let panelDimensions: { width: number; height: number };
+        
+        if (packageModel.type === "box") {
+          const { width, height, depth } = packageModel.dimensions;
+          if (panel.id === "front" || panel.id === "back") {
+            panelDimensions = { width, height };
+          } else if (panel.id === "left" || panel.id === "right") {
+            panelDimensions = { width: depth, height };
+          } else {
+            panelDimensions = { width, height: depth };
+          }
+        } else {
+          // Cylinder
+          const { width, height } = packageModel.dimensions;
+          if (panel.id === "body") {
+            const circumference = Math.PI * width;
+            panelDimensions = { width: circumference, height };
+          } else {
+            const radius = width / 2;
+            panelDimensions = { width: radius * 2, height: radius * 2 };
+          }
+        }
+        
+        panelsInfo[panel.id] = panelDimensions;
+      }
+
+      console.log("[AIChatPanel] Calling generateAllTextures with:", {
+        panel_ids: panelIds,
+        prompt: prompt.trim(),
+        package_type: packageModel.type,
+      });
+
+      const success = await generateAllTextures({
+        prompt: prompt.trim(),
+        package_type: packageModel.type,
+        package_dimensions: packageModel.dimensions,
+        panel_ids: panelIds,
+        panels_info: panelsInfo,
+        reference_mockup: referenceMockup || undefined,
+      });
+
+      if (success) {
+        console.log("[AIChatPanel] Bulk generation completed, fetching textures");
+        setHistory([
+          ...history,
+          {
+            prompt,
+            response: `Successfully generated textures for all ${panelIds.length} panels!`,
+          },
+        ]);
+        
+        // Fetch all textures and notify parent
+        for (const panelId of panelIds) {
+          try {
+            const response = await fetch(API_ENDPOINTS.packaging.getTexture(panelId));
+            if (response.ok) {
+              const data = await response.json();
+              if (data.texture_url) {
+                onTextureGenerated?.(panelId, data.texture_url);
+              }
+            }
+          } catch (err) {
+            console.warn(`[AIChatPanel] Could not fetch texture for ${panelId}:`, err);
+          }
+        }
+      } else {
+        const errorMsg = error || "Failed to generate textures. Please try again.";
+        console.error("[AIChatPanel] Bulk generation failed:", errorMsg);
+        setHistory([
+          ...history,
+          {
+            prompt,
+            response: errorMsg,
+          },
+        ]);
+      }
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : "An error occurred";
+      console.error("[AIChatPanel] Error in handleGenerateAll:", err);
+      setHistory([
+        ...history,
+        {
+          prompt,
+          response: `Error: ${errorMessage}`,
+        },
+      ]);
+    } finally {
+      setPrompt("");
+      setIsProcessing(false);
+    }
+  };
+
+  const handleSubmit = async () => {
+    console.log("[AIChatPanel] handleSubmit called", { prompt, selectedPanelId, hasPackageModel: !!packageModel });
+    
+    if (!prompt.trim()) {
+      console.log("[AIChatPanel] Prompt is empty, returning");
+      return;
+    }
+    
+    // Check validation
+    if (validationError) {
+      setHistory([
+        ...history,
+        {
+          prompt: prompt.trim(),
+          response: validationError,
+        },
+      ]);
+      return;
+    }
+
+    // If no panel is selected, show error
+    if (!selectedPanelId) {
+      console.log("[AIChatPanel] No panel selected");
+      setHistory([
+        ...history,
+        {
+          prompt,
+          response: "Please select a panel first to apply changes.",
+        },
+      ]);
+      setPrompt("");
+      return;
+    }
+
+    if (!packageModel) {
+      console.log("[AIChatPanel] No package model");
+      setHistory([
+        ...history,
+        {
+          prompt,
+          response: "Package model not available.",
+        },
+      ]);
+      setPrompt("");
+      return;
+    }
+
+    setIsProcessing(true);
+    console.log("[AIChatPanel] Starting texture generation...");
+
+    try {
+      // Calculate panel dimensions
+      const panel = packageModel.panels.find((p) => p.id === selectedPanelId);
+      if (!panel) {
+        throw new Error("Panel not found");
+      }
+
+      let panelDimensions: { width: number; height: number };
+      
+      if (packageModel.type === "box") {
+        const { width, height, depth } = packageModel.dimensions;
+        if (selectedPanelId === "front" || selectedPanelId === "back") {
+          panelDimensions = { width, height };
+        } else if (selectedPanelId === "left" || selectedPanelId === "right") {
+          panelDimensions = { width: depth, height };
+        } else {
+          panelDimensions = { width, height: depth };
+        }
+      } else {
+        // Cylinder
+        const { width, height } = packageModel.dimensions;
+        if (selectedPanelId === "body") {
+          const circumference = Math.PI * width;
+          panelDimensions = { width: circumference, height };
+        } else {
+          const radius = width / 2;
+          panelDimensions = { width: radius * 2, height: radius * 2 };
+        }
+      }
+
+      console.log("[AIChatPanel] Calling generateTexture with:", {
+        panel_id: selectedPanelId,
+        prompt: prompt.trim(),
+        package_type: packageModel.type,
+        panel_dimensions: panelDimensions,
+      });
+
+      // Test backend connectivity first - try both localhost and 127.0.0.1
+      let backendReachable = false;
+      const testUrls = ["http://127.0.0.1:8000/health", "http://localhost:8000/health"];
+      
+      for (const testUrl of testUrls) {
+        try {
+          const testResponse = await fetch(testUrl);
+          if (testResponse.ok) {
+            console.log(`[AIChatPanel] Backend connectivity test passed using ${testUrl}`);
+            backendReachable = true;
+            break;
+          }
+        } catch (testError) {
+          console.warn(`[AIChatPanel] Failed to connect to ${testUrl}:`, testError);
+        }
+      }
+      
+      if (!backendReachable) {
+        console.error("[AIChatPanel] Backend connectivity test failed for all URLs");
+        setHistory([
+          ...history,
+          {
+            prompt,
+            response: `Cannot connect to backend. Make sure it's running on http://127.0.0.1:8000 or http://localhost:8000. Check the backend terminal for errors.`,
+          },
+        ]);
+        setPrompt("");
+        setIsProcessing(false);
+        return;
+      }
+
+      // Generate texture using the prompt with optional reference mockup
+      const texture = await generateTexture({
+        panel_id: selectedPanelId,
+        prompt: prompt.trim(),
+        package_type: packageModel.type,
+        panel_dimensions: panelDimensions,
+        package_dimensions: packageModel.dimensions,
+        reference_mockup: referenceMockup || undefined,
+      });
+
+      console.log("[AIChatPanel] Texture generation result:", texture ? "success" : "failed", { error });
+
+      if (texture && texture.texture_url) {
+        console.log("[AIChatPanel] Texture generated successfully, calling onTextureGenerated");
+        console.log("[AIChatPanel] Texture URL:", texture.texture_url.substring(0, 100) + "...");
+        setHistory([
+          ...history,
+          {
+            prompt,
+            response: `Successfully applied "${prompt}" to the ${panel.name} panel.`,
+          },
+        ]);
+        onTextureGenerated?.(selectedPanelId, texture.texture_url);
+      } else if (texture && !texture.texture_url) {
+        console.error("[AIChatPanel] Texture object exists but texture_url is missing:", texture);
+        setHistory([
+          ...history,
+          {
+            prompt,
+            response: "Texture generation completed but no image was returned. The AI may have refused the request or encountered an error.",
+          },
+        ]);
+      } else {
+        const errorMsg = error || "Failed to generate texture. Please try again.";
+        console.error("[AIChatPanel] Texture generation failed:", errorMsg);
+        setHistory([
+          ...history,
+          {
+            prompt,
+            response: errorMsg,
+          },
+        ]);
+      }
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : "An error occurred";
+      console.error("[AIChatPanel] Error in handleSubmit:", err);
+      setHistory([
+        ...history,
+        {
+          prompt,
+          response: `Error: ${errorMessage}`,
+        },
+      ]);
+    } finally {
+      setPrompt("");
+      setIsProcessing(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      {/* Prompt Input */}
+      <Textarea
+        placeholder="Describe style, colors, patterns..."
+        value={prompt}
+        onChange={(e) => {
+          const newValue = e.target.value;
+          setPrompt(newValue);
+          // Validate immediately on change
+          validatePrompt(newValue);
+        }}
+        onBlur={(e) => {
+          // Re-validate on blur to catch any edge cases
+          validatePrompt(e.target.value);
+        }}
+        className={`min-h-[70px] resize-none text-sm ${
+          validationError ? "border-red-500 border-2 focus:border-red-600" : ""
+        }`}
+        disabled={isProcessing || bulkGenerating}
+      />
+      
+      {/* Validation error */}
+      {validationError && (
+        <div className="text-xs text-red-600 dark:text-red-400 font-medium p-2 bg-red-50 dark:bg-red-950 rounded border-2 border-red-500">
+          {validationError}
+        </div>
+      )}
+      
+      {/* Reference Upload */}
+      <div className="flex items-center gap-2">
+        <input
+          type="file"
+          id="reference-upload"
+          accept="image/*"
+          onChange={handleMockupUpload}
+          className="hidden"
+          disabled={isProcessing || bulkGenerating}
+        />
+        <label
+          htmlFor="reference-upload"
+          className={`text-xs font-semibold px-3 py-1.5 rounded border-2 border-black bg-background hover:bg-muted transition-colors cursor-pointer ${
+            isProcessing || bulkGenerating ? "opacity-50 cursor-not-allowed" : ""
+          }`}
+        >
+          Upload Reference
+        </label>
+        {referenceMockup && (
+          <>
+            <span className="text-xs font-medium text-green-600">Loaded</span>
+            <button
+              onClick={() => setReferenceMockup(null)}
+              className="text-xs font-semibold text-red-600 hover:underline"
+            >
+              Remove
+            </button>
+          </>
+        )}
+      </div>
+      
+      {/* Action Buttons */}
+      <div className="grid grid-cols-2 gap-2">
+        <Button
+          onClick={(e) => {
+            e.preventDefault();
+            console.log("[AIChatPanel] Generate panel button clicked", { prompt: prompt.trim(), isProcessing, selectedPanelId });
+            handleSubmit();
+          }}
+          disabled={!prompt.trim() || isProcessing || bulkGenerating || !selectedPanelId || !!validationError}
+          variant="outline"
+          className="w-full text-xs font-semibold"
+          size="sm"
+        >
+          {isProcessing && !bulkGenerating ? (
+            <>
+              <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+              Generating...
+            </>
+          ) : (
+            "Generate Panel"
+          )}
+        </Button>
+        
+        <Button
+          onClick={(e) => {
+            e.preventDefault();
+            console.log("[AIChatPanel] Generate all button clicked", { prompt: prompt.trim(), isProcessing, bulkGenerating });
+            handleGenerateAll();
+          }}
+          disabled={!prompt.trim() || isProcessing || bulkGenerating || !!validationError}
+          variant="default"
+          className="w-full text-xs font-semibold"
+          size="sm"
+        >
+          {bulkGenerating ? (
+            <>
+              <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+              Generating All...
+            </>
+          ) : (
+            "Generate All Panels"
+          )}
+        </Button>
+      </div>
+
+      {/* Progress Status */}
+      {(isProcessing || bulkGenerating) && (
+        <div className="text-xs p-2.5 bg-muted rounded border-2 border-black">
+          {bulkGenerating ? (
+            <div className="space-y-0.5">
+              <p className="font-semibold">Generating all panels</p>
+              <p className="text-muted-foreground">This may take 1-3 minutes</p>
+            </div>
+          ) : (
+            <p className="text-muted-foreground">Generating (10-30 seconds)</p>
+          )}
+        </div>
+      )}
+
+      {/* History */}
+      {history.length > 0 && (
+        <div className="space-y-2 pt-2 border-t-2 border-black">
+          <div className="text-xs font-semibold text-muted-foreground">HISTORY</div>
+          <div className="space-y-2 max-h-[200px] overflow-y-auto">
+            {history
+              .slice()
+              .reverse()
+              .map((item, i) => (
+                <div key={i} className="text-xs p-2.5 bg-muted/50 rounded border-2 border-black">
+                  <p className="font-semibold mb-1.5">{item.prompt}</p>
+                  <p className="text-muted-foreground text-[11px] leading-relaxed">{item.response}</p>
+                </div>
+              ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
